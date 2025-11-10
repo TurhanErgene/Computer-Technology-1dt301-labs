@@ -66,6 +66,10 @@ The helper functions use SIO registers:
 -**leds_off() → clears both LED pins**
 
 ```c
+#include "pico/stdlib.h"
+#include "hardware/gpio.h"
+#include "hardware/regs/sio.h"
+
 #define LED0    0
 #define LED1    1
 #define BTN_ON  2
@@ -108,3 +112,147 @@ int main() {
 ### Result
 Both LEDs respond simultaneously to button inputs.
 This confirms correct use of bitmask-based control and direct register I/O for multiple outputs.
+
+
+## Task 2 – Binary counter with GPIO interrupts
+
+### Design
+Four LEDs on **GP0..GP3** display a 4-bit counter. Two buttons control increment and decrement:
+- **BTN_INC → GP5** with pull-down, triggers on rising edge.
+- **BTN_DEC → GP6** with pull-down, triggers on rising edge.
+
+Interrupt service routine debounces per GPIO using a timestamp array and updates the counter within bounds **0..15**. Display uses `gpio_put_masked` with a 4-bit mask.
+
+### Behavior
+- Press **BTN_INC**: counter++ if `< 15`.
+- Press **BTN_DEC**: counter-- if `> 0`.
+- LEDs always reflect the current 4-bit value.
+
+### Code
+```c
+#include "pico/stdlib.h"
+#include "hardware/gpio.h"
+
+#define LED_BASE     0
+#define LED_MASK     (0xFu << LED_BASE)
+#define BTN_INC      5
+#define BTN_DEC      6
+#define DEBOUNCE_MS  120
+
+static volatile uint8_t counter = 0;
+static uint32_t last_ms_per_gpio[32];
+
+static inline void show_counter(void) {
+    gpio_put_masked(LED_MASK, ((uint32_t)(counter & 0xF) << LED_BASE));
+}
+
+static void button_isr(uint gpio, uint32_t events) {
+    if (!(events & GPIO_IRQ_EDGE_RISE)) return;
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (now - last_ms_per_gpio[gpio] < DEBOUNCE_MS) return;
+    last_ms_per_gpio[gpio] = now;
+
+    if (gpio == BTN_INC) { if (counter < 15) counter++; }
+    else if (gpio == BTN_DEC) { if (counter > 0) counter--; }
+    show_counter();
+}
+
+int main() {
+    stdio_init_all();
+
+    for (int p = LED_BASE; p < LED_BASE + 4; ++p) {
+        gpio_init(p);
+        gpio_set_dir(p, GPIO_OUT);
+        gpio_put(p, 0);
+    }
+    show_counter();
+
+    gpio_init(BTN_INC); gpio_set_dir(BTN_INC, GPIO_IN); gpio_pull_down(BTN_INC);
+    gpio_init(BTN_DEC); gpio_set_dir(BTN_DEC, GPIO_IN); gpio_pull_down(BTN_DEC);
+
+    gpio_set_irq_enabled_with_callback(BTN_INC, GPIO_IRQ_EDGE_RISE, true, button_isr);
+    gpio_set_irq_enabled(BTN_DEC, GPIO_IRQ_EDGE_RISE, true);
+
+    while (true) tight_loop_contents();
+}
+```
+### Result
+- Power on shows 0000 on LEDs GP0..GP3.
+- Press BTN_INC repeatedly: LEDs count up to 1111. Pressing again at 1111 leaves value unchanged.
+- Press BTN_DEC repeatedly: LEDs count down to 0000. Pressing again at 0000 leaves value unchanged.
+- Single presses generate single steps with DEBOUNCE_MS = 120. Fast chattering does not cause multi-steps.
+- Verified that ISR runs only on rising edges by observing stable counts when holding the buttons.
+
+
+## Task 3 – Binary counter with timer interrupt and reset button
+
+### Design
+Same LED layout on GP0..GP3. A repeating timer ticks every 1000 ms and increments the counter until it reaches 15. A reset button on GP6 uses a GPIO interrupt with rising-edge detection and per-GPIO debounce.
+
+### Behavior
+- Timer: increment counter once per second while < 15.
+- BTN_RST → GP6 pressed: counter resets to 0 and display updates immediately.
+- Counting resumes after reset. Stops automatically at 15.
+
+### Code
+```c
+#include "pico/stdlib.h"
+#include "pico/time.h"
+#include "hardware/gpio.h"
+
+#define LED_BASE     0
+#define LED_MASK     (0xFu << LED_BASE)
+#define BTN_RST      6
+#define DEBOUNCE_MS  120
+
+static volatile uint8_t counter = 0;
+static uint32_t last_ms_per_gpio[32];
+static repeating_timer_t tick;
+
+static inline void show_counter(void) {
+    gpio_put_masked(LED_MASK, ((uint32_t)(counter & 0xF) << LED_BASE));
+}
+
+static bool tick_cb(repeating_timer_t *t) {
+    if (counter < 15) {
+        counter++;
+        show_counter();
+    }
+    return true;
+}
+
+static void gpio_isr(uint gpio, uint32_t events) {
+    if (gpio != BTN_RST || !(events & GPIO_IRQ_EDGE_RISE)) return;
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (now - last_ms_per_gpio[gpio] < DEBOUNCE_MS) return;
+    last_ms_per_gpio[gpio] = now;
+
+    counter = 0;
+    show_counter();
+}
+
+int main() {
+    stdio_init_all();
+
+    for (int p = LED_BASE; p < LED_BASE + 4; ++p) {
+        gpio_init(p);
+        gpio_set_dir(p, GPIO_OUT);
+        gpio_put(p, 0);
+    }
+    show_counter();
+
+    gpio_init(BTN_RST);
+    gpio_set_dir(BTN_RST, GPIO_IN);
+    gpio_pull_down(BTN_RST);
+    gpio_set_irq_enabled_with_callback(BTN_RST, GPIO_IRQ_EDGE_RISE, true, gpio_isr);
+
+    add_repeating_timer_ms(1000, tick_cb, NULL, &tick);
+
+    while (true) tight_loop_contents();
+}
+```
+### Result
+- After reset or power on, LEDs show 0000. Counter increases to 1111 in 15 seconds, then holds.
+- Pressing BTN_RST sets LEDs to 0000 immediately regardless of current value. Counting resumes with the next 1 s tick.
+- Measured tick cadence is approximately 1 s. Minor jitter is within SDK timer tolerance and does not skip values.
+- Debounce prevents spurious resets from mechanical bounce.
